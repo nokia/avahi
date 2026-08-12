@@ -31,6 +31,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 
 #ifdef HAVE_LIBSYSTEMD
 #include <systemd/sd-daemon.h>
@@ -40,6 +41,7 @@
 #include <avahi-common/llist.h>
 #include <avahi-common/malloc.h>
 #include <avahi-common/error.h>
+#include <avahi-common/timeval.h>
 
 #include <avahi-core/log.h>
 #include <avahi-core/lookup.h>
@@ -62,6 +64,8 @@
 #define BUFFER_SIZE (20*1024)
 
 #define CLIENTS_MAX 50
+
+#define LOG_RATELIMIT_USEC (5 * 1000000LL)
 
 typedef struct Client Client;
 typedef struct Server Server;
@@ -102,6 +106,9 @@ struct Server {
 
     unsigned n_clients;
     int remove_socket;
+
+    struct timeval last_accept_error;
+    struct timeval last_refuse_log;
 };
 
 static Server *server = NULL;
@@ -438,17 +445,45 @@ static void client_work(AvahiWatch *watch, AVAHI_GCC_UNUSED int fd, AvahiWatchEv
         (c->inbuf_length < sizeof(c->inbuf) ? AVAHI_WATCH_IN : 0));
 }
 
+static int log_ratelimit(struct timeval *last) {
+    int ret;
+
+    assert(last);
+
+    if ((last->tv_sec != 0 || last->tv_usec != 0) &&
+        avahi_age(last) < LOG_RATELIMIT_USEC)
+        return 0;
+
+    ret = gettimeofday(last, NULL);
+    if (ret < 0) {
+        avahi_log_warn("gettimeofday(): %s", strerror(errno));
+        return 0;
+    }
+
+    return 1;
+}
+
 static void server_work(AVAHI_GCC_UNUSED AvahiWatch *watch, int fd, AvahiWatchEvent events, void *userdata) {
     Server *s = userdata;
+    int ret;
 
     assert(s);
 
     if (events & AVAHI_WATCH_IN) {
         int cfd;
 
-        if ((cfd = accept(fd, NULL, NULL)) < 0)
-            avahi_log_error("accept(): %s", strerror(errno));
-        else
+        if ((cfd = accept(fd, NULL, NULL)) < 0) {
+            if (log_ratelimit(&s->last_accept_error))
+                avahi_log_error("accept(): %s", strerror(errno));
+        } else if (s->n_clients >= CLIENTS_MAX) {
+            ret = close(cfd);
+            if (ret < 0) {
+                avahi_log_warn("close(): %s", strerror(errno));
+            }
+
+            if (log_ratelimit(&s->last_refuse_log))
+                avahi_log_warn("Maximum number of connections (%u) reached, refusing new client.", (unsigned) CLIENTS_MAX);
+        } else
             client_new(s, cfd);
     }
 }
@@ -469,6 +504,8 @@ int simple_protocol_setup(const AvahiPoll *poll_api) {
     server->n_clients = 0;
     AVAHI_LLIST_HEAD_INIT(Client, server->clients);
     server->watch = NULL;
+    server->last_accept_error = (struct timeval){.tv_sec = 0, .tv_usec = 0};
+    server->last_refuse_log = (struct timeval){.tv_sec = 0, .tv_usec = 0};
 
     u = umask(0000);
 

@@ -41,8 +41,13 @@ valgrind_log_file="/tmp/valgrind.avahi-daemon.%p"
 
 dump_journal() {
     if [[ "$WITH_SYSTEMD" == false ]]; then
-        cat /var/adm/messages || true
-        cat /var/log/messages
+        cat /var/adm/messages 2>/dev/null || true
+        cat /var/log/messages 2>/dev/null || true
+        cat /var/log/syslog 2>/dev/null || true
+        if command -v journalctl >/dev/null 2>&1; then
+            journalctl --sync 2>/dev/null || true
+            journalctl -b -t avahi-daemon --no-pager 2>/dev/null || true
+        fi
     else
         journalctl --sync
         journalctl -b -u "avahi-*" --no-pager
@@ -76,6 +81,66 @@ should_fail() {
         dump_journal
         exit 1
     fi
+}
+
+wait_for_log() {
+    local pattern="$1" i
+
+    for ((i = 0; i < 30; i++)); do
+        if [[ "$WITH_SYSTEMD" == false ]]; then
+            if grep -qF "$pattern" /var/log/messages 2>/dev/null ||
+               grep -qF "$pattern" /var/adm/messages 2>/dev/null ||
+               grep -qF "$pattern" /var/log/syslog 2>/dev/null; then
+                return 0
+            fi
+            if command -v journalctl >/dev/null 2>&1; then
+                journalctl --sync 2>/dev/null || true
+                if journalctl -b -t avahi-daemon --no-pager 2>/dev/null | grep -qF "$pattern"; then
+                    return 0
+                fi
+            fi
+        else
+            journalctl --sync 2>/dev/null || true
+            if journalctl -b -u "avahi-*" --no-pager 2>/dev/null | grep -qF "$pattern"; then
+                return 0
+            fi
+        fi
+        sleep 1
+    done
+
+    return 1
+}
+
+test_connection_limit() {
+    local pids=() i
+
+    if ! command -v socat >/dev/null 2>&1; then
+        echo "socat not available, skipping connection limit test"
+        return 0
+    fi
+
+    for ((i = 0; i < 70; i++)); do
+        sleep 30 | socat -T35 - unix-connect:"$avahi_socket" >/dev/null 2>&1 &
+        pids+=("$!")
+    done
+
+    if ! wait_for_log "refusing new client"; then
+        kill -9 "${pids[@]}" 2>/dev/null || true
+        dump_journal
+        exit 1
+    fi
+
+    kill -9 "${pids[@]}" 2>/dev/null || true
+    wait "${pids[@]}" 2>/dev/null || true
+
+    for ((i = 0; i < 30; i++)); do
+        if { printf "HELP\n"; sleep 1; } | socat -T5 - unix-connect:"$avahi_socket" | grep -qF "Available commands"; then
+            return 0
+        fi
+    done
+
+    dump_journal
+    exit 1
 }
 
 dbus_call() {
@@ -348,6 +413,7 @@ run drill -p5353 @127.0.0.1 "$h" HINFO
 run drill -p5353 @127.0.0.1 _domain._udp.local ANY
 drill -Q -p5353 @127.0.0.1 "$l._ssh._tcp.local" TXT | grep org.freedesktop.Avahi.cookie
 
+test_connection_limit
 
 if [[ "$OS" =~ (freebsd|netbsd|omnios|openbsd) ]]; then
     "$PYTHON" -c '
