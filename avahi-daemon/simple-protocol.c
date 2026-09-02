@@ -35,8 +35,9 @@
 #ifdef HAVE_LIBSYSTEMD
 #include <systemd/sd-daemon.h>
 #endif
-#ifdef HAVE_STRUCT_XUCRED
-#include <sys/ucred.h>
+
+#ifdef HAVE_UCRED_H
+#include <ucred.h>
 #endif
 
 #include <avahi-common/domain.h>
@@ -85,7 +86,7 @@ static int credentials_getsockopt(int fd, AvahiCred *cred, socklen_t *len) {
     if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, cred, len) != 0)
         return -1;
     if (*len != sizeof(*cred)) {
-        avahi_log_error("credentials_getsockopt: unexpected credential size %u (expected %zu)",
+        avahi_log_debug("credentials_getsockopt: unexpected credential size %u (expected %zu)",
                         (unsigned)*len, sizeof(*cred));
         return -1;
     }
@@ -95,51 +96,73 @@ static int credentials_getsockopt(int fd, AvahiCred *cred, socklen_t *len) {
 #  define CRED_FMT     "uid=%lu gid=%lu pid=%ld"
 #  define CRED_ARGS(ucred) , (unsigned long)credentials_getuid(ucred), (unsigned long)credentials_getgid(ucred), (long)credentials_getpid(ucred)
 
-#elif defined(HAVE_STRUCT_XUCRED) && defined(XUCRED_VERSION)
-/* FreeBSD support, man 4 unix */
-typedef struct xucred AvahiCred;
-
-static int credentials_version_check(const AvahiCred *cred) {
-    if (cred->cr_version != XUCRED_VERSION) {
-        avahi_log_debug("credentials_version_check: unsupported version %d",
-                        cred->cr_version);
-        return 0;
-    }
-    return 1;
-}
+#elif defined(HAVE_GETPEEREID)
+/* BSD support by getpeereid */
+typedef struct AvahiCred {
+    uid_t uid;
+    gid_t gid;
+} AvahiCred;
 
 static uid_t credentials_getuid(const AvahiCred *cred) {
-    if (!credentials_version_check(cred))
-        return (uid_t)-1;
-    return cred->cr_uid;
+    return cred->uid;
 }
 
 static gid_t credentials_getgid(const AvahiCred *cred) {
-    if (!credentials_version_check(cred) || cred->cr_ngroups <= 0)
-        return 0;
-    return cred->cr_groups[0];
-}
-
-static pid_t credentials_getpid(const AvahiCred *cred) {
-    if (!credentials_version_check(cred))
-        return 0;
-    return cred->cr_pid;
+    return cred->gid;
 }
 
 static int credentials_getsockopt(int fd, AvahiCred *cred, socklen_t *len) {
     *len = sizeof(*cred);
-    if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERCRED, cred, len) != 0)
+    return getpeereid(fd, &cred->uid, &cred->gid);
+}
+
+#  define CRED_FMT     "uid=%lu gid=%lu"
+#  define CRED_ARGS(cred) , (unsigned long)credentials_getuid(cred), (unsigned long)credentials_getgid(cred)
+
+#elif defined(HAVE_GETPEERUCRED)
+/* illumos/Solaris support by getpeerucred(3C). */
+typedef struct AvahiCred {
+    uid_t uid;
+    gid_t gid;
+    pid_t pid;
+} AvahiCred;
+
+static uid_t credentials_getuid(const AvahiCred *cred) {
+    return cred->uid;
+}
+
+static gid_t credentials_getgid(const AvahiCred *cred) {
+    return cred->gid;
+}
+
+static pid_t credentials_getpid(const AvahiCred *cred) {
+    return cred->pid;
+}
+
+static int credentials_getsockopt(int fd, AvahiCred *cred, socklen_t *len) {
+    ucred_t *uc = NULL;
+
+    *len = sizeof(*cred);
+
+    if (getpeerucred(fd, &uc) != 0)
         return -1;
-    if (*len != sizeof(*cred)) {
-        avahi_log_error("credentials_getsockopt: unexpected credential size %u (expected %zu)",
-                        (unsigned)*len, sizeof(*cred));
+
+    cred->uid = ucred_geteuid(uc);
+    cred->gid = ucred_getegid(uc);
+    cred->pid = ucred_getpid(uc);
+    ucred_free(uc);
+
+    /* if ucred_geteuid() (uid_t)-1 it means unknown UID, refuse the connection */
+    if (cred->uid == (uid_t)-1) {
+        errno = ENOTSUP;
         return -1;
     }
+
     return 0;
 }
 
 #  define CRED_FMT     "uid=%lu gid=%lu pid=%ld"
-#  define CRED_ARGS(ucred) , (unsigned long)credentials_getuid(ucred), (unsigned long)credentials_getgid(ucred), (long)credentials_getpid(ucred)
+#  define CRED_ARGS(cred) , (unsigned long)credentials_getuid(cred), (unsigned long)credentials_getgid(cred), (long)credentials_getpid(cred)
 
 #else
 /* No credential retrieval support on this platform */
@@ -554,14 +577,14 @@ static int is_client_allowed(Server *s, int cfd, AvahiCred *cred) {
     assert(s != NULL);
 
     n_clients = s->n_clients + 1;
-    if (credentials_getsockopt(cfd, cred, &len) != 0) {
-        avahi_log_error("Failed to get peer credentials for fd %d: %s", cfd, strerror(errno));
+    if (n_clients > s->max_clients) {
+        /* Debug so it will not flood the log. */
+        avahi_log_debug("simple client %d refused: too many clients", cfd);
         return 0;
     }
 
-    if (n_clients > s->max_clients) {
-        avahi_log_debug("simple client %d refused: "CRED_FMT" too many clients",
-                        cfd CRED_ARGS(cred));
+    if (credentials_getsockopt(cfd, cred, &len) != 0) {
+        avahi_log_debug("Failed to get peer credentials for fd %d: %s", cfd, strerror(errno));
         return 0;
     }
 
@@ -635,7 +658,10 @@ int simple_protocol_setup(const AvahiPoll *poll_api, unsigned max_clients) {
     server->fd = -1;
     server->n_clients = 0;
     server->max_clients = max_clients;
-    server->max_uid_clients = max_clients / 2;
+    /* A single non-root UID may hold at most a quarter of the total */
+    server->max_uid_clients = max_clients / 4;
+    if (server->max_uid_clients < 1)
+        server->max_uid_clients = 1;
     AVAHI_LLIST_HEAD_INIT(Client, server->clients);
     server->watch = NULL;
 
@@ -698,8 +724,9 @@ int simple_protocol_setup(const AvahiPoll *poll_api, unsigned max_clients) {
     umask(u);
 
     server->watch = poll_api->watch_new(poll_api, server->fd, AVAHI_WATCH_IN, server_work, server);
-    avahi_log_info("Maximal simple clients: %u, per_uid: %u",
-                    max_clients, server->max_uid_clients);
+    /* Notice so OpenBSD stock syslog will not drop this message */
+    avahi_log_notice("Maximal simple clients: %u, per_uid: %u",
+                     max_clients, server->max_uid_clients);
 
     return 0;
 

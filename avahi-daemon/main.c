@@ -90,8 +90,8 @@
 #include "dbus-protocol.h"
 #endif
 
-/* Maximal number of concurrent simple protocol clients. */
-#define MAX_NOFILE_LIMIT 4096
+/* Maximal number of concurrent simple protocol clients */
+#define MAX_SIMPLE_CLIENTS 4096
 
 AvahiServer *avahi_server = NULL;
 AvahiSimplePoll *simple_poll_api = NULL;
@@ -1195,14 +1195,17 @@ static int run_server(DaemonConfig *c) {
     {
         struct rlimit rl;
         rlim_t effective_nofile = config.rlimit_nofile;
+        rlim_t share;
 
         if (getrlimit(RLIMIT_NOFILE, &rl) == 0)
             effective_nofile = rl.rlim_cur;
 
-        if (effective_nofile > MAX_NOFILE_LIMIT)
-            nofiles = MAX_NOFILE_LIMIT;
-        else if (effective_nofile > 0)
-            nofiles = (unsigned)(effective_nofile * 3 / 4);
+        share = effective_nofile / 2;
+
+        if (share > MAX_SIMPLE_CLIENTS)
+            nofiles = MAX_SIMPLE_CLIENTS;
+        else if (share > 0)
+            nofiles = (unsigned) share;
         else
             nofiles = 1;
     }

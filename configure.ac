@@ -222,21 +222,6 @@ if test $avahi_cv_has_struct_lifconf = yes; then
 fi
 
 #
-# Check for xucred struct; only present on FreeBSD
-#
-AC_MSG_CHECKING(for struct xucred)
-AC_CACHE_VAL(avahi_cv_has_struct_xucred,
-[AC_TRY_COMPILE(
-[#include <sys/socket.h>
-#include <sys/ucred.h>
-],[sizeof (struct xucred);],
-avahi_cv_has_struct_xucred=yes,avahi_cv_has_struct_xucred=no)])
-AC_MSG_RESULT($avahi_cv_has_struct_xucred)
-if test $avahi_cv_has_struct_xucred = yes; then
-    AC_DEFINE(HAVE_STRUCT_XUCRED,1,[Define if there is a struct xucred.])
-fi
-
-#
 # Check for struct ip_mreqn
 #
 AC_MSG_CHECKING(for struct ip_mreqn)
@@ -382,8 +367,8 @@ AC_FUNC_SELECT_ARGTYPES
 # whether libc's malloc does too. (Same for realloc.)
 #AC_FUNC_MALLOC
 #AC_FUNC_REALLOC
-AC_CHECK_FUNCS([gethostname memchr memmove memset mkdir select socket strchr strcspn strdup strerror strrchr strspn strstr uname setresuid setreuid setresgid setregid strcasecmp gettimeofday putenv strncasecmp strlcpy gethostbyname seteuid setegid setproctitle getprogname getrandom])
-AC_CHECK_HEADERS([sys/random.h])
+AC_CHECK_FUNCS([gethostname memchr memmove memset mkdir select socket strchr strcspn strdup strerror strrchr strspn strstr uname setresuid setreuid setresgid setregid strcasecmp gettimeofday putenv strncasecmp strlcpy gethostbyname seteuid setegid setproctitle getprogname getrandom getpeereid getpeerucred])
+AC_CHECK_HEADERS([sys/random.h ucred.h])
 
 AC_FUNC_CHOWN
 AC_FUNC_STAT
