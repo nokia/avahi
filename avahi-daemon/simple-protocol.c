@@ -45,6 +45,7 @@
 #include <avahi-common/malloc.h>
 #include <avahi-common/error.h>
 
+#include <avahi-core/hashmap.h>
 #include <avahi-core/log.h>
 #include <avahi-core/lookup.h>
 #include <avahi-core/dns-srv-rr.h>
@@ -224,6 +225,7 @@ struct Server {
     unsigned n_clients;
     unsigned max_clients;     /*< Maximal number of all simple clients. */
     unsigned max_uid_clients; /*< Maximal number of clients of one UID. */
+    AvahiHashmap *uid_clients; /*< UID -> UidClients, see uid_clients_ref(). */
     int remove_socket;
 };
 
@@ -231,11 +233,83 @@ static Server *server = NULL;
 
 static void client_work(AvahiWatch *watch, int fd, AvahiWatchEvent events, void *userdata);
 
+typedef struct UidClients {
+    uid_t uid;
+    unsigned n;
+} UidClients;
+
+static unsigned uid_hash(const void *data) {
+    const uid_t *uid = data;
+
+    assert(uid);
+
+    return (unsigned) *uid;
+}
+
+static int uid_equal(const void *a, const void *b) {
+    const uid_t *_a = a, *_b = b;
+
+    assert(_a);
+    assert(_b);
+
+    return *_a == *_b;
+}
+
+static unsigned uid_clients_count(Server *s, uid_t uid) {
+    UidClients *u;
+
+    assert(s);
+
+    if (!(u = avahi_hashmap_lookup(s->uid_clients, &uid)))
+        return 0;
+
+    return u->n;
+}
+
+static int uid_clients_ref(Server *s, uid_t uid) {
+    UidClients *u;
+
+    assert(s);
+
+    if ((u = avahi_hashmap_lookup(s->uid_clients, &uid))) {
+        u->n++;
+        return 0;
+    }
+
+    if (!(u = avahi_new(UidClients, 1)))
+        return -1;
+
+    u->uid = uid;
+    u->n = 1;
+
+    if (avahi_hashmap_insert(s->uid_clients, &u->uid, u) < 0) {
+        avahi_free(u);
+        return -1;
+    }
+
+    return 0;
+}
+
+static void uid_clients_unref(Server *s, uid_t uid) {
+    UidClients *u;
+
+    assert(s);
+
+    if (!(u = avahi_hashmap_lookup(s->uid_clients, &uid)))
+        return;
+
+    assert(u->n >= 1);
+
+    if (--u->n == 0)
+        avahi_hashmap_remove(s->uid_clients, &uid);
+}
+
 static void client_free(Client *c) {
     assert(c);
 
     assert(c->server->n_clients >= 1);
     c->server->n_clients--;
+    uid_clients_unref(c->server, credentials_getuid(&c->credentials));
 
     if (c->host_name_resolver)
         avahi_s_host_name_resolver_free(c->host_name_resolver);
@@ -255,12 +329,19 @@ static void client_free(Client *c) {
     avahi_free(c);
 }
 
-static void client_new(Server *s, int fd, const AvahiCred *cred) {
+static int client_new(Server *s, int fd, const AvahiCred *cred) {
     Client *c;
 
     assert(fd >= 0);
 
-    c = avahi_new(Client, 1);
+    if (!(c = avahi_new(Client, 1)))
+        return -1;
+
+    if (uid_clients_ref(s, credentials_getuid(cred)) < 0) {
+        avahi_free(c);
+        return -1;
+    }
+
     c->server = s;
     c->fd = fd;
     c->state = CLIENT_IDLE;
@@ -276,6 +357,8 @@ static void client_new(Server *s, int fd, const AvahiCred *cred) {
 
     AVAHI_LLIST_PREPEND(Client, clients, s->clients, c);
     s->n_clients++;
+
+    return 0;
 }
 
 static void client_output(Client *c, const uint8_t*data, size_t size) {
@@ -597,22 +680,10 @@ static int is_client_allowed(Server *s, int cfd, AvahiCred *cred) {
      * "unknown UID" bucket, which effectively limits them to max_uid_clients
      * instead of max_clients. This is an acceptable tradeoff: returning 0
      * (root) would silently skip per-UID enforcement entirely. */
-    if (uid != 0 && n_clients >= s->max_uid_clients) {
-        /* There are enough clients to reach the limit for one UID.
-         * Check this UID does not have too many connections already. */
-        Client *c;
-        unsigned present = 0;
-
-        for (c = s->clients; c; c = c->clients_next) {
-            if (credentials_getuid(&c->credentials) == uid) {
-                present++;
-                if (present >= s->max_uid_clients) {
-                    avahi_log_debug("simple client %d refused: "CRED_FMT" too many uid clients: %u",
-                                    cfd CRED_ARGS(cred), present);
-                    return 0;
-                }
-            }
-        }
+    if (uid != 0 && uid_clients_count(s, uid) >= s->max_uid_clients) {
+        avahi_log_debug("simple client %d refused: "CRED_FMT" too many uid clients: %u",
+                        cfd CRED_ARGS(cred), s->max_uid_clients);
+        return 0;
     }
     avahi_log_debug("simple client %d/%u accepted: "CRED_FMT,
                     cfd, n_clients CRED_ARGS(cred));
@@ -634,9 +705,11 @@ static void server_work(AVAHI_GCC_UNUSED AvahiWatch *watch, int fd, AvahiWatchEv
                 avahi_log_debug(__FILE__" accept(): %s", strerror(errno));
         } else {
             AvahiCred cred;
-            if (is_client_allowed(s, cfd, &cred))
-                client_new(s, cfd, &cred);
-            else {
+            if (!is_client_allowed(s, cfd, &cred))
+                close(cfd);
+            else if (client_new(s, cfd, &cred) < 0) {
+                /* debug level to not flood the log */
+                avahi_log_debug(__FILE__" client_new(): out of memory");
                 close(cfd);
             }
         }
@@ -664,8 +737,14 @@ int simple_protocol_setup(const AvahiPoll *poll_api, unsigned max_clients) {
         server->max_uid_clients = 1;
     AVAHI_LLIST_HEAD_INIT(Client, server->clients);
     server->watch = NULL;
+    server->uid_clients = NULL;
 
     u = umask(0000);
+
+    if (!(server->uid_clients = avahi_hashmap_new(uid_hash, uid_equal, NULL, avahi_free))) {
+        avahi_log_warn("avahi_hashmap_new(): Out of memory");
+        goto fail;
+    }
 
 #ifdef HAVE_LIBSYSTEMD
     if ((n = sd_listen_fds(1)) < 0) {
@@ -757,6 +836,9 @@ void simple_protocol_shutdown(void) {
 
         if (server->fd >= 0)
             close(server->fd);
+
+        if (server->uid_clients)
+            avahi_hashmap_free(server->uid_clients);
 
         avahi_free(server);
 
