@@ -279,10 +279,6 @@ else
     run systemctl start avahi-dnsconfd
 fi
 
-# Exercise dump_journal() on the temporary CI branch and verify that it
-# retrieves messages from the running daemon.
-dump_journal | grep -F "Server startup complete" >/dev/null
-
 (cd avahi-daemon && run ./ini-file-parser-test)
 
 if [[ "$WITH_DBUS" == true ]]; then
@@ -386,6 +382,10 @@ except OSError:
     pass
 '
 fi
+
+# Exercise dump_journal() on the temporary CI branch and verify that it
+# retrieves messages from the running daemon.
+dump_journal | grep -F "Server startup complete" >/dev/null
 
 if [[ "$WITH_SYSTEMD" == false ]]; then
     run avahi-dnsconfd --kill
