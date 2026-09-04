@@ -40,18 +40,25 @@ avahi_socket="$avahi_daemon_runtime_dir/socket"
 valgrind_log_file="/tmp/valgrind.avahi-daemon.%p"
 
 dump_journal() {
+    local log_file
+
     if command -v journalctl >/dev/null 2>&1 && journalctl --sync 2>/dev/null; then
         if [[ "$WITH_SYSTEMD" == true ]]; then
             journalctl -b -u "avahi-*" --no-pager
         else
             journalctl -b -t avahi-daemon --no-pager
         fi
-    elif [[ -f /var/log/syslog ]]; then
-        cat /var/log/syslog
-    elif [[ -f /var/log/messages ]]; then
-        cat /var/log/messages
-    elif [[ -f /var/adm/messages ]]; then
-        cat /var/adm/messages
+    else
+        for log_file in \
+            /var/log/syslog \
+            /var/log/messages \
+            /var/log/daemon \
+            /var/log/daemon.log \
+            /var/adm/messages; do
+            if [[ -r "$log_file" ]]; then
+                cat "$log_file"
+            fi
+        done
     fi
 }
 
@@ -279,6 +286,14 @@ else
     run systemctl start avahi-dnsconfd
 fi
 
+dump_journal_marker="dump-journal-test-$$"
+if [[ "$WITH_SYSTEMD" == true ]]; then
+    run systemd-run --wait --unit=avahi-test-dump-journal \
+        logger -p daemon.notice -t avahi-daemon "$dump_journal_marker"
+else
+    logger -p daemon.notice -t avahi-daemon "$dump_journal_marker"
+fi
+
 (cd avahi-daemon && run ./ini-file-parser-test)
 
 if [[ "$WITH_DBUS" == true ]]; then
@@ -384,8 +399,8 @@ except OSError:
 fi
 
 # Exercise dump_journal() on the temporary CI branch and verify that it
-# retrieves messages from the running daemon.
-dump_journal | grep -F "Server startup complete" >/dev/null
+# retrieves the marker through the selected logging backend.
+dump_journal | grep -F "$dump_journal_marker" >/dev/null
 
 if [[ "$WITH_SYSTEMD" == false ]]; then
     run avahi-dnsconfd --kill
