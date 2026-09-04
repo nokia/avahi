@@ -40,12 +40,18 @@ avahi_socket="$avahi_daemon_runtime_dir/socket"
 valgrind_log_file="/tmp/valgrind.avahi-daemon.%p"
 
 dump_journal() {
-    if [[ "$WITH_SYSTEMD" == false ]]; then
-        cat /var/adm/messages || true
+    if command -v journalctl >/dev/null 2>&1 && journalctl --sync 2>/dev/null; then
+        if [[ "$WITH_SYSTEMD" == true ]]; then
+            journalctl -b -u "avahi-*" --no-pager
+        else
+            journalctl -b -t avahi-daemon --no-pager
+        fi
+    elif [[ -f /var/log/syslog ]]; then
+        cat /var/log/syslog
+    elif [[ -f /var/log/messages ]]; then
         cat /var/log/messages
-    else
-        journalctl --sync
-        journalctl -b -u "avahi-*" --no-pager
+    elif [[ -f /var/adm/messages ]]; then
+        cat /var/adm/messages
     fi
 }
 
