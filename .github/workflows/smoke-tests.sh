@@ -393,7 +393,8 @@ fi
 # Check real avahi logs, then (on journald hosts) that the -u vs -t
 # filter matches how the daemon was started.
 dump_journal | grep -F avahi-daemon | tee /tmp/dump-journal-avahi
-grep -F "Server startup complete" /tmp/dump-journal-avahi >/dev/null
+# daemon.notice is kept on BSD/illumos syslog; daemon.info often is not.
+grep -F "Static host name" /tmp/dump-journal-avahi >/dev/null
 
 if command -v journalctl >/dev/null 2>&1 && journalctl --sync 2>/dev/null; then
     journalctl -b -u "avahi-*" --no-pager | tee /tmp/journal-by-unit || true
