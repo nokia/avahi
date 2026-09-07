@@ -8,6 +8,7 @@ on:
   push:
     branches:
       - master
+      - test-fix-dump-journal
 
 permissions:
   contents: read
