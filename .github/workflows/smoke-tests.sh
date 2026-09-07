@@ -286,14 +286,6 @@ else
     run systemctl start avahi-dnsconfd
 fi
 
-dump_journal_marker="dump-journal-test-$$"
-if [[ "$WITH_SYSTEMD" == true ]]; then
-    run systemd-run --wait --unit=avahi-test-dump-journal \
-        logger -p daemon.notice -t avahi-daemon "$dump_journal_marker"
-else
-    logger -p daemon.notice -t avahi-daemon "$dump_journal_marker"
-fi
-
 (cd avahi-daemon && run ./ini-file-parser-test)
 
 if [[ "$WITH_DBUS" == true ]]; then
@@ -398,9 +390,9 @@ except OSError:
 '
 fi
 
-# Exercise dump_journal() on the temporary CI branch and verify that it
-# retrieves the marker through the selected logging backend.
-dump_journal | grep -F "$dump_journal_marker" >/dev/null
+# Check real avahi logs.
+dump_journal | grep -F avahi-daemon | tee /tmp/dump-journal-avahi
+grep -F "Server startup complete" /tmp/dump-journal-avahi >/dev/null
 
 if [[ "$WITH_SYSTEMD" == false ]]; then
     run avahi-dnsconfd --kill
