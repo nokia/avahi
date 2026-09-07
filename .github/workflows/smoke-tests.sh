@@ -390,9 +390,28 @@ except OSError:
 '
 fi
 
-# Check real avahi logs.
+# Check real avahi logs, then (on journald hosts) that the -u vs -t
+# filter matches how the daemon was started.
 dump_journal | grep -F avahi-daemon | tee /tmp/dump-journal-avahi
 grep -F "Server startup complete" /tmp/dump-journal-avahi >/dev/null
+
+if command -v journalctl >/dev/null 2>&1 && journalctl --sync 2>/dev/null; then
+    journalctl -b -u "avahi-*" --no-pager | tee /tmp/journal-by-unit || true
+    journalctl -b -t avahi-daemon --no-pager | tee /tmp/journal-by-tag || true
+
+    if [[ "$WITH_SYSTEMD" == true ]]; then
+        # systemctl start: logs have _SYSTEMD_UNIT, so -u sees both units.
+        grep -F "Server startup complete" /tmp/journal-by-unit
+        grep -F avahi-dnsconfd /tmp/journal-by-unit
+    else
+        # avahi-daemon -D: no unit, -u is empty; syslog ident still matches -t.
+        grep -F "Server startup complete" /tmp/journal-by-tag
+        if grep -F "Server startup complete" /tmp/journal-by-unit; then
+            echo "journalctl -u avahi-* unexpectedly found daemonized avahi-daemon logs" >&2
+            exit 1
+        fi
+    fi
+fi
 
 if [[ "$WITH_SYSTEMD" == false ]]; then
     run avahi-dnsconfd --kill
